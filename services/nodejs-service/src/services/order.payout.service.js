@@ -84,8 +84,8 @@ async function applyOrderClosePayout({
       const after = runningBalance + amount;
       await UserTransaction.create({
         transaction_id: txnId,
-        user_id: transactionUserId,
-        user_type: transactionUserType,
+        user_id: parseInt(String(userId), 10),
+        user_type: String(userType),
         order_id: orderPk || null,
         type: 'commission',
         amount: amount,
