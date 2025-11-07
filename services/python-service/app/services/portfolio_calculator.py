@@ -21,6 +21,11 @@ from app.services.portfolio.symbol_margin_aggregator import compute_symbol_margi
 from app.services.portfolio.conversion_utils import convert_to_usd as portfolio_convert_to_usd
 from app.services.portfolio.user_margin_service import compute_user_total_margin
 from app.services.orders.order_repository import fetch_user_config as repo_fetch_user_config
+from app.config.redis_logging import (
+    log_pool_usage, log_connection_acquire, log_connection_release, 
+    log_connection_error, log_pipeline_operation, connection_tracker
+)
+import uuid
 
 # Env-driven strict mode
 STRICT_MODE = os.getenv("PORTFOLIO_STRICT_MODE", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -295,11 +300,27 @@ class PortfolioCalculatorListener:
             if not symbols:
                 return prices
             # Pipeline HMGET for all symbols to reduce round trips and pool usage
-            pipe = redis_cluster.pipeline()
-            keys = [f"market:{symbol}" for symbol in symbols]
-            for k in keys:
-                pipe.hmget(k, ["bid", "ask"])  # [bid, ask]
-            results = await pipe.execute()
+            op_id = str(uuid.uuid4())[:8]
+            connection_tracker.start_operation(op_id, "cluster", f"fetch_market_prices_{len(symbols)}_symbols")
+            log_connection_acquire("cluster", f"fetch_market_prices_{len(symbols)}_symbols")
+            
+            start_time = time.time()
+            try:
+                async with redis_cluster.pipeline() as pipe:
+                    keys = [f"market:{symbol}" for symbol in symbols]
+                    for k in keys:
+                        pipe.hmget(k, ["bid", "ask"])  # [bid, ask]
+                    results = await pipe.execute()
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_pipeline_operation("cluster", f"market_prices_{len(symbols)}_symbols", len(symbols), duration_ms)
+                log_connection_release("cluster", f"fetch_market_prices_{len(symbols)}_symbols", duration_ms)
+                connection_tracker.end_operation(op_id, success=True)
+            except Exception as e:
+                duration_ms = (time.time() - start_time) * 1000
+                log_connection_error("cluster", f"fetch_market_prices_{len(symbols)}_symbols", str(e))
+                connection_tracker.end_operation(op_id, success=False, error=str(e))
+                raise
             for i, symbol in enumerate(symbols):
                 try:
                     vals = results[i]
@@ -773,13 +794,41 @@ class PortfolioCalculatorListener:
             chosen_used = (float(total_margin) if (has_queued and (total_margin is not None)) else (float(executed_margin) if executed_margin is not None else 0.0))
             portfolio['used_margin'] = str(round(chosen_used, 2))
 
-            await redis_cluster.hset(redis_key, mapping=portfolio)
-            self.logger.info(f"✅ Portfolio calc: WROTE portfolio to Redis key={redis_key} equity={portfolio.get('equity')} margin_level={portfolio.get('margin_level')}")
-            # Publish a lightweight notification for watchers (AutoCutoff, dashboards, etc.)
+            # Track portfolio update operation
+            update_op_id = str(uuid.uuid4())[:8]
+            connection_tracker.start_operation(update_op_id, "cluster", f"portfolio_update_{user_type}_{user_id}")
+            log_connection_acquire("cluster", f"portfolio_update_{user_type}_{user_id}")
+            
+            start_time = time.time()
             try:
+                await redis_cluster.hset(redis_key, mapping=portfolio)
+                duration_ms = (time.time() - start_time) * 1000
+                log_connection_release("cluster", f"portfolio_update_{user_type}_{user_id}", duration_ms)
+                connection_tracker.end_operation(update_op_id, success=True)
+                
+                self.logger.info(f"✅ Portfolio calc: WROTE portfolio to Redis key={redis_key} equity={portfolio.get('equity')} margin_level={portfolio.get('margin_level')}")
+            except Exception as e:
+                duration_ms = (time.time() - start_time) * 1000
+                log_connection_error("cluster", f"portfolio_update_{user_type}_{user_id}", str(e))
+                connection_tracker.end_operation(update_op_id, success=False, error=str(e))
+                raise
+            
+            # Publish a lightweight notification for watchers (AutoCutoff, dashboards, etc.)
+            pub_op_id = str(uuid.uuid4())[:8]
+            try:
+                connection_tracker.start_operation(pub_op_id, "pubsub", f"portfolio_notification_{user_type}_{user_id}")
+                log_connection_acquire("pubsub", f"portfolio_notification_{user_type}_{user_id}")
+                
+                pub_start_time = time.time()
                 await redis_pubsub_client.publish('portfolio_updates', f"{user_type}:{user_id}")
+                pub_duration_ms = (time.time() - pub_start_time) * 1000
+                
+                log_connection_release("pubsub", f"portfolio_notification_{user_type}_{user_id}", pub_duration_ms)
+                connection_tracker.end_operation(pub_op_id, success=True)
                 self.logger.debug(f"📢 Portfolio calc: Published portfolio_updates for {user_type}:{user_id}")
             except Exception as pub_err:
+                log_connection_error("pubsub", f"portfolio_notification_{user_type}_{user_id}", str(pub_err))
+                connection_tracker.end_operation(pub_op_id, success=False, error=str(pub_err))
                 self.logger.warning(f"Failed to publish portfolio update for {user_type}:{user_id}: {pub_err}")
         except Exception as e:
             self.logger.error(f"Error updating portfolio for {redis_key}: {e}")

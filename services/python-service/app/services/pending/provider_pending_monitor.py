@@ -33,18 +33,18 @@ async def register_provider_pending(info: Dict[str, Any]) -> None:
         group = str(info.get("group") or "Standard")
         if not order_id:
             return
-        p = redis_cluster.pipeline()
-        p.sadd(SET_ACTIVE, order_id)
-        p.hset(_hkey(order_id), mapping={
-            "symbol": symbol,
-            "order_type": order_type,
-            "order_quantity": order_qty,
-            "user_id": user_id,
-            "user_type": user_type,
-            "group": group,
-            "created_at": str(int(asyncio.get_event_loop().time() * 1000)),
-        })
-        await p.execute()
+        async with redis_cluster.pipeline() as p:
+            p.sadd(SET_ACTIVE, order_id)
+            p.hset(_hkey(order_id), mapping={
+                "symbol": symbol,
+                "order_type": order_type,
+                "order_quantity": order_qty,
+                "user_id": user_id,
+                "user_type": user_type,
+                "group": group,
+                "created_at": str(int(asyncio.get_event_loop().time() * 1000)),
+            })
+            await p.execute()
     except Exception:
         logger.exception("register_provider_pending failed for %s", info.get("order_id"))
 

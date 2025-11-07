@@ -66,7 +66,7 @@ class RedisConfig:
             "health_check_interval": 30,
             "socket_connect_timeout": 5,    # Faster connection timeout
             "socket_timeout": 5,            # Faster socket timeout
-            "max_connections": 200,         # 25 connections per core (8 cores)
+            "max_connections": 500,         # Increased from 200 to handle high-frequency operations
             "address_remap": address_remap,
         }
     
@@ -84,7 +84,7 @@ redis_pubsub_client = redis.Redis(
     port=7001, 
     decode_responses=True,
     password=redis_password,
-    max_connections=10,          # Pub/Sub uses a small dedicated pool
+    max_connections=50,          # Increased from 10 to handle high-frequency pub/sub operations
     socket_connect_timeout=5,    # Connection timeout
     socket_timeout=None,         # Disable read timeout for long-lived pub/sub listen
     health_check_interval=30     # Health check every 30s

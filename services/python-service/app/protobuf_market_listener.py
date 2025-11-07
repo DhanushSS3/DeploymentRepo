@@ -14,7 +14,12 @@ from collections import deque
 from app.services.market_data_service import MarketDataService
 from app.services.logging.execution_price_logger import log_websocket_issue, log_market_processing
 from app.config.redis_config import redis_pubsub_client
+from app.config.redis_logging import (
+    log_pool_usage, log_connection_acquire, log_connection_release, 
+    log_connection_error, log_pipeline_operation, connection_tracker
+)
 import threading
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -207,28 +212,80 @@ class ProtobufMarketListener:
                 continue
 
             async with self.redis_semaphore:
-                try:
-                    async with self.market_service.redis.pipeline() as pipe:
-                        ts = int(time.time() * 1000)
-                        for symbol, bid, ask in updates:
-                            pipe.hset(f"market:{symbol}", mapping={"bid": bid, "ask": ask, "ts": ts})
-                        await pipe.execute()
-                    
-                    # Publish updated symbols to notify portfolio calculator and other subscribers
-                    unique_symbols = list(set([symbol for symbol, _, _ in updates]))
-                    if unique_symbols:
-                        try:
-                            async with redis_pubsub_client.pipeline() as pub_pipe:
-                                for sym in unique_symbols:
-                                    pub_pipe.publish("market_price_updates", sym)
-                                await pub_pipe.execute()
-                            logger.debug(f"Published {len(unique_symbols)} symbol updates to market_price_updates channel")
-                        except Exception as pub_err:
-                            logger.warning(f"Failed to publish market_price_updates: {pub_err}")
-                            
-                except Exception as e:
-                    logger.error(f"Redis writer pipeline error: {e}")
-                    await asyncio.sleep(0.05)
+                # Generate unique operation ID for tracking
+                cluster_op_id = str(uuid.uuid4())[:8]
+                pubsub_op_id = str(uuid.uuid4())[:8]
+                
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Track cluster pipeline operation start
+                        connection_tracker.start_operation(
+                            cluster_op_id, "cluster", f"market_data_pipeline_{len(updates)}_symbols"
+                        )
+                        log_connection_acquire("cluster", f"market_data_pipeline_{len(updates)}_symbols")
+                        
+                        start_time = time.time()
+                        # Use async context manager to ensure proper connection cleanup
+                        async with self.market_service.redis.pipeline() as pipe:
+                            ts = int(time.time() * 1000)
+                            for symbol, bid, ask in updates:
+                                pipe.hset(f"market:{symbol}", mapping={"bid": bid, "ask": ask, "ts": ts})
+                            await pipe.execute()
+                        
+                        duration_ms = (time.time() - start_time) * 1000
+                        log_pipeline_operation("cluster", f"market_data_{len(updates)}_symbols", len(updates), duration_ms)
+                        log_connection_release("cluster", f"market_data_pipeline_{len(updates)}_symbols", duration_ms)
+                        connection_tracker.end_operation(cluster_op_id, success=True)
+                        
+                        # Publish updated symbols to notify portfolio calculator and other subscribers
+                        unique_symbols = list(set([symbol for symbol, _, _ in updates]))
+                        if unique_symbols:
+                            try:
+                                # Track pubsub pipeline operation start
+                                connection_tracker.start_operation(
+                                    pubsub_op_id, "pubsub", f"market_notifications_{len(unique_symbols)}_symbols"
+                                )
+                                log_connection_acquire("pubsub", f"market_notifications_{len(unique_symbols)}_symbols")
+                                
+                                pub_start_time = time.time()
+                                # Use async context manager for pubsub pipeline
+                                async with redis_pubsub_client.pipeline() as pub_pipe:
+                                    for sym in unique_symbols:
+                                        pub_pipe.publish("market_price_updates", sym)
+                                    await pub_pipe.execute()
+                                
+                                pub_duration_ms = (time.time() - pub_start_time) * 1000
+                                log_pipeline_operation("pubsub", f"notifications_{len(unique_symbols)}_symbols", len(unique_symbols), pub_duration_ms)
+                                log_connection_release("pubsub", f"market_notifications_{len(unique_symbols)}_symbols", pub_duration_ms)
+                                connection_tracker.end_operation(pubsub_op_id, success=True)
+                                
+                                logger.debug(f"Published {len(unique_symbols)} symbol updates to market_price_updates channel")
+                            except Exception as pub_err:
+                                logger.warning(f"Failed to publish market_price_updates: {pub_err}")
+                                log_connection_error("pubsub", f"market_notifications_{len(unique_symbols)}_symbols", str(pub_err))
+                                connection_tracker.end_operation(pubsub_op_id, success=False, error=str(pub_err))
+                        
+                        break  # Success, exit retry loop
+                        
+                    except (ConnectionError, TimeoutError, OSError) as e:
+                        log_connection_error("cluster", f"market_data_pipeline_{len(updates)}_symbols", str(e), attempt + 1)
+                        connection_tracker.end_operation(cluster_op_id, success=False, error=str(e))
+                        
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Redis writer connection error on attempt {attempt + 1}/{max_retries}: {e}. Retrying...")
+                            await asyncio.sleep(0.01 * (2 ** attempt))  # Exponential backoff
+                            # Generate new operation ID for retry
+                            cluster_op_id = str(uuid.uuid4())[:8]
+                        else:
+                            logger.error(f"Redis writer pipeline error after {max_retries} attempts: {e}")
+                            await asyncio.sleep(0.05)
+                    except Exception as e:
+                        logger.error(f"Unexpected Redis writer error: {e}")
+                        log_connection_error("cluster", f"market_data_pipeline_{len(updates)}_symbols", str(e))
+                        connection_tracker.end_operation(cluster_op_id, success=False, error=str(e))
+                        await asyncio.sleep(0.05)
+                        break
             # Periodic debug (every ~1s): queue size and last msg age
             try:
                 if int(time.time() * 1000) // 1000 % 1 == 0:

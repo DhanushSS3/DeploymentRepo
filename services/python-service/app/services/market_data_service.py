@@ -124,11 +124,12 @@ class MarketDataService:
         Args:
             update_shard: List of partial price update tuples for this shard
         """
-        max_retries = 1  # Minimal retries for maximum speed
+        max_retries = 3  # Increased retries for better reliability
         retry_delay = 0.01  # 10ms - ultra-fast retry for zero tick loss
         
         for attempt in range(max_retries):
             try:
+                # Use async context manager to ensure proper connection cleanup
                 async with self.redis.pipeline() as pipe:
                     # Batch all operations in pipeline for better performance
                     for symbol, update_fields, timestamp in update_shard:
@@ -403,25 +404,35 @@ class MarketDataService:
         logger.debug(f"Publishing price update notifications for {len(symbols_in_message)} unique symbols")
         
         # Batch publish notifications for better performance
-        try:
-            # Use pipeline for pub/sub operations to reduce network round trips
-            async with self.pubsub_redis.pipeline() as pipe:
-                for symbol in symbols_in_message:
-                    pipe.publish("market_price_updates", symbol)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Use async context manager for pipeline to ensure proper connection cleanup
+                async with self.pubsub_redis.pipeline() as pipe:
+                    for symbol in symbols_in_message:
+                        pipe.publish("market_price_updates", symbol)
+                    
+                    # Execute all publications at once
+                    await pipe.execute()
+                    
+                logger.debug(f"Batch published {len(symbols_in_message)} symbol notifications")
+                return  # Success, exit retry loop
                 
-                # Execute all publications at once
-                await pipe.execute()
-                
-            logger.debug(f"Batch published {len(symbols_in_message)} symbol notifications")
-            
-        except Exception as e:
-            logger.error(f"Failed to batch publish notifications: {e}")
-            # Fallback to individual publishing
-            for symbol in symbols_in_message:
-                try:
-                    await self.pubsub_redis.publish("market_price_updates", symbol)
-                except Exception as symbol_error:
-                    logger.error(f"Failed to publish symbol {symbol}: {symbol_error}")
+            except (ConnectionError, TimeoutError, OSError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"PubSub connection error on attempt {attempt + 1}/{max_retries}: {e}. Retrying...")
+                    await asyncio.sleep(0.01 * (2 ** attempt))  # Exponential backoff
+                else:
+                    logger.error(f"Failed to batch publish notifications after {max_retries} attempts: {e}")
+                    # Fallback to individual publishing
+                    for symbol in symbols_in_message:
+                        try:
+                            await self.pubsub_redis.publish("market_price_updates", symbol)
+                        except Exception as symbol_error:
+                            logger.error(f"Failed to publish symbol {symbol}: {symbol_error}")
+            except Exception as e:
+                logger.error(f"Unexpected error in batch publish: {e}")
+                break
     
     def is_price_stale(self, timestamp: int) -> bool:
         """Check if price timestamp is stale (>5s old)"""
