@@ -57,16 +57,18 @@ class RedisConfig:
             }
             return mapping.get(host, (host, port))
 
-        # Create optimized configuration for 8-core CPU with high-frequency data
-        # Using only supported parameters for redis-py compatibility
+        # Enhanced configuration for production with proper connection management
+        # Increased connection pool since Redis has low resource usage
         self.cluster_config = {
             "startup_nodes": startup_nodes,
             "decode_responses": True,
             "password": redis_password,
             "health_check_interval": 30,
-            "socket_connect_timeout": 5,    # Faster connection timeout
-            "socket_timeout": 5,            # Faster socket timeout
-            "max_connections": 500,         # Increased from 200 to handle high-frequency operations
+            "socket_connect_timeout": 10,   # Increased timeout for network stability
+            "socket_timeout": 10,           # Increased timeout for slow operations
+            "socket_keepalive": True,       # Enable TCP keepalive for persistent connections
+            "socket_keepalive_options": {},
+            "max_connections": 1000,        # Significantly increased since Redis has low resource usage
             "address_remap": address_remap,
         }
     

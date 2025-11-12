@@ -57,7 +57,7 @@ async def _clear_flags(user_type: str, user_id: str):
 
 async def _handle_user(user_type: str, user_id: str, notifier: EmailNotifier, liq: LiquidationEngine):
     ml = await _get_margin_level(user_type, user_id)
-    logger.info("AutoCutoffWatcher: checking user %s:%s margin_level=%.2f", user_type, user_id, ml)
+    # logger.info("AutoCutoffWatcher: checking user %s:%s margin_level=%.2f", user_type, user_id, ml)
     
     if ml >= 50.0:
         logger.debug("AutoCutoffWatcher: user %s:%s is safe (margin_level=%.2f)", user_type, user_id, ml)

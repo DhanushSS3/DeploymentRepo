@@ -262,7 +262,18 @@ class ProtobufMarketListener:
                                 
                                 logger.debug(f"Published {len(unique_symbols)} symbol updates to market_price_updates channel")
                             except Exception as pub_err:
-                                logger.warning(f"Failed to publish market_price_updates: {pub_err}")
+                                # Detailed error logging for pub/sub failures
+                                import traceback
+                                logger.error(
+                                    f"❌ PROTOBUF_LISTENER: Pub/Sub publish error - "
+                                    f"SymbolCount: {len(unique_symbols)}, "
+                                    f"Symbols: {unique_symbols[:3]}, "  # First 3 symbols
+                                    f"ErrorType: {type(pub_err).__name__}, "
+                                    f"ErrorMsg: {str(pub_err)}, "
+                                    f"OpId: {pubsub_op_id}"
+                                )
+                                logger.debug(f"Full traceback for pub/sub error: {traceback.format_exc()}")
+                                
                                 log_connection_error("pubsub", f"market_notifications_{len(unique_symbols)}_symbols", str(pub_err))
                                 connection_tracker.end_operation(pubsub_op_id, success=False, error=str(pub_err))
                         
@@ -281,7 +292,29 @@ class ProtobufMarketListener:
                             logger.error(f"Redis writer pipeline error after {max_retries} attempts: {e}")
                             await asyncio.sleep(0.05)
                     except Exception as e:
-                        logger.error(f"Unexpected Redis writer error: {e}")
+                        # Detailed error logging to identify exact failure points
+                        import traceback
+                        error_details = {
+                            "updates_count": len(updates),
+                            "symbols": [symbol for symbol, _, _ in updates[:5]],  # First 5 symbols for context
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "operation_id": cluster_op_id,
+                            "attempt": attempt + 1,
+                            "max_retries": max_retries
+                        }
+                        
+                        logger.error(
+                            f"❌ PROTOBUF_LISTENER: Redis writer error - "
+                            f"UpdatesCount: {len(updates)}, "
+                            f"Symbols: {[symbol for symbol, _, _ in updates[:3]]}, "  # First 3 symbols
+                            f"ErrorType: {type(e).__name__}, "
+                            f"ErrorMsg: {str(e)}, "
+                            f"Attempt: {attempt + 1}/{max_retries}, "
+                            f"OpId: {cluster_op_id}"
+                        )
+                        logger.debug(f"Full traceback for Redis writer error: {traceback.format_exc()}")
+                        
                         log_connection_error("cluster", f"market_data_pipeline_{len(updates)}_symbols", str(e))
                         connection_tracker.end_operation(cluster_op_id, success=False, error=str(e))
                         await asyncio.sleep(0.05)

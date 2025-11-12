@@ -135,8 +135,8 @@ class PortfolioCalculatorListener:
         """
         For each dirty user, fetch all open orders, fetch prices, calculate, and update Redis
         """
-        if user_ids:
-            self.logger.info(f"⚙️ Portfolio calc: Processing {len(user_ids)} dirty {user_type} users")
+        # if user_ids:
+            # self.logger.info(f"⚙️ Portfolio calc: Processing {len(user_ids)} dirty {user_type} users")
         for user_key in user_ids:
             try:
                 if not user_key.startswith(f"{user_type}:"):
@@ -806,7 +806,7 @@ class PortfolioCalculatorListener:
                 log_connection_release("cluster", f"portfolio_update_{user_type}_{user_id}", duration_ms)
                 connection_tracker.end_operation(update_op_id, success=True)
                 
-                self.logger.info(f"✅ Portfolio calc: WROTE portfolio to Redis key={redis_key} equity={portfolio.get('equity')} margin_level={portfolio.get('margin_level')}")
+                # self.logger.info(f"✅ Portfolio calc: WROTE portfolio to Redis key={redis_key} equity={portfolio.get('equity')} margin_level={portfolio.get('margin_level')}")
             except Exception as e:
                 duration_ms = (time.time() - start_time) * 1000
                 log_connection_error("cluster", f"portfolio_update_{user_type}_{user_id}", str(e))
@@ -858,16 +858,13 @@ class PortfolioCalculatorListener:
     async def _process_symbol_update(self, symbol: str):
         """
         Process a single symbol update by fetching affected users
-        Single Responsibility: Only handles symbol update processing
+        Optimized: Batch fetch all user types in single pipeline operation to reduce connections
         """
         try:
             # self.logger.info(f"🔔 Portfolio calc: Processing symbol update: {symbol}")
             
-            # Fetch affected users for all user types
-            live_users = await self._fetch_symbol_holders(symbol, 'live')
-            demo_users = await self._fetch_symbol_holders(symbol, 'demo')
-            strategy_provider_users = await self._fetch_symbol_holders(symbol, 'strategy_provider')
-            copy_follower_users = await self._fetch_symbol_holders(symbol, 'copy_follower')
+            # Batch fetch all user types in single pipeline operation to prevent connection exhaustion
+            live_users, demo_users, strategy_provider_users, copy_follower_users = await self._fetch_all_symbol_holders_batch(symbol)
             
             # self.logger.info(f"📊 Portfolio calc: Found holders - live:{len(live_users)} demo:{len(demo_users)} strategy_provider:{len(strategy_provider_users)} copy_follower:{len(copy_follower_users)}")
             
@@ -897,20 +894,23 @@ class PortfolioCalculatorListener:
     
     async def _fetch_symbol_holders(self, symbol: str, user_type: str) -> Set[str]:
         """
-        Fetch all users holding positions in a specific symbol
+        Fetch all users holding positions in a specific symbol with proper connection management
         
         Args:
             symbol: The trading symbol (e.g., 'EURUSD')
-            user_type: 'live' or 'demo'
+            user_type: Type of user ('live', 'demo', 'strategy_provider', 'copy_follower')
             
         Returns:
             Set of user identifiers in format 'user_type:user_id'
         """
+        redis_key = f"symbol_holders:{symbol}:{user_type}"
+        
         try:
-            redis_key = f"symbol_holders:{symbol}:{user_type}"
-            
-            # Use Redis SMEMBERS to get all users holding this symbol
-            user_ids = await redis_cluster.smembers(redis_key)
+            # Use proper connection management with pipeline to prevent connection leaks
+            async with redis_cluster.pipeline() as pipe:
+                pipe.smembers(redis_key)
+                results = await pipe.execute()
+                user_ids = results[0] if results else set()
             
             if user_ids:
                 # Convert to set and ensure proper format
@@ -928,10 +928,85 @@ class PortfolioCalculatorListener:
             return set()
             
         except Exception as e:
+            # Detailed error logging to identify exact failure points
+            import traceback
+            error_details = {
+                "symbol": symbol,
+                "user_type": user_type,
+                "redis_key": redis_key,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "traceback": traceback.format_exc()
+            }
+            
             self.logger.error(
-                f"Error fetching symbol holders for {symbol}:{user_type}: {e}"
+                f"❌ PORTFOLIO_CALC: Failed to fetch symbol holders - "
+                f"Symbol: {symbol}, UserType: {user_type}, "
+                f"RedisKey: {redis_key}, "
+                f"ErrorType: {type(e).__name__}, "
+                f"ErrorMsg: {str(e)}"
             )
+            self.logger.debug(f"Full traceback for symbol_holders error: {traceback.format_exc()}")
+            
             return set()
+    
+    async def _fetch_all_symbol_holders_batch(self, symbol: str) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
+        """
+        Batch fetch all user types for a symbol in single pipeline operation
+        This prevents connection pool exhaustion by using only one connection
+        
+        Args:
+            symbol: The trading symbol (e.g., 'EURUSD')
+            
+        Returns:
+            Tuple of (live_users, demo_users, strategy_provider_users, copy_follower_users)
+        """
+        user_types = ['live', 'demo', 'strategy_provider', 'copy_follower']
+        redis_keys = [f"symbol_holders:{symbol}:{user_type}" for user_type in user_types]
+        
+        try:
+            # Single pipeline operation to fetch all user types at once
+            async with redis_cluster.pipeline() as pipe:
+                for redis_key in redis_keys:
+                    pipe.smembers(redis_key)
+                results = await pipe.execute()
+            
+            # Process results for each user type
+            all_users = []
+            for i, user_type in enumerate(user_types):
+                user_ids = results[i] if i < len(results) and results[i] else set()
+                
+                if user_ids:
+                    # Convert to set and ensure proper format
+                    formatted_users = {
+                        f"{user_type}:{user_id}" if not user_id.startswith(f"{user_type}:") 
+                        else user_id 
+                        for user_id in user_ids
+                    }
+                    all_users.append(formatted_users)
+                    
+                    self.logger.debug(
+                        f"Found {len(formatted_users)} {user_type} users for symbol {symbol}"
+                    )
+                else:
+                    all_users.append(set())
+            
+            return tuple(all_users)
+            
+        except Exception as e:
+            # Detailed error logging for batch operation
+            import traceback
+            self.logger.error(
+                f"❌ PORTFOLIO_CALC: Failed to batch fetch symbol holders - "
+                f"Symbol: {symbol}, "
+                f"RedisKeys: {redis_keys}, "
+                f"ErrorType: {type(e).__name__}, "
+                f"ErrorMsg: {str(e)}"
+            )
+            self.logger.debug(f"Full traceback for batch symbol_holders error: {traceback.format_exc()}")
+            
+            # Return empty sets for all user types on error
+            return set(), set(), set(), set()
     
     def _add_to_dirty_users(self, user_ids: Set[str], user_type: str) -> int:
         """
