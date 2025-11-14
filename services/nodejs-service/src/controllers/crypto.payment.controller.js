@@ -229,6 +229,13 @@ class CryptoPaymentController {
       if (!isValidSignature) {
         // Log signature validation failure with expected signature for development
         const expectedSignature = cryptoPaymentService.createSignature(process.env.TLP_API_SECRET, rawBody);
+        
+        // Debug: Print expected HMAC signature to console
+        console.log('🔐 HMAC Signature Validation Failed:');
+        console.log('   Received Signature:', signature);
+        console.log('   Expected Signature:', expectedSignature);
+        console.log('   Raw Body Length:', rawBody ? rawBody.length : 0);
+        
         cryptoPaymentLogger.logSignatureValidationFailure(
           signature,
           expectedSignature,

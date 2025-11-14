@@ -257,7 +257,7 @@ async function login(req, res) {
       session_id: sessionId
     };
 
-    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: '30m', jwtid: sessionId });
+    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: '7d', jwtid: sessionId });
     const refreshToken = jwt.sign(
       { userId: user.id, sessionId },
       JWT_SECRET + '_REFRESH',
@@ -302,7 +302,7 @@ async function login(req, res) {
       message: 'Login successful',
       access_token: token,
       refresh_token: refreshToken,
-      expires_in: 900, // 15 minutes in seconds
+      expires_in: 604800, // 7 days in seconds
       token_type: 'Bearer',
       session_id: sessionId
     });
@@ -360,7 +360,7 @@ async function refreshToken(req, res) {
     };
     
     const newAccessToken = jwt.sign(jwtPayload, JWT_SECRET, { 
-      expiresIn: '30m', 
+      expiresIn: '7d', 
       jwtid: sessionId 
     });
 
@@ -389,7 +389,7 @@ async function refreshToken(req, res) {
       message: 'Token refreshed successfully',
       access_token: newAccessToken,
       refresh_token: newRefreshToken,
-      expires_in: 900, // 15 minutes in seconds
+      expires_in: 604800, // 7 days in seconds
       token_type: 'Bearer',
       session_id: sessionId
     });

@@ -379,7 +379,7 @@ class CryptoPaymentService {
         newBaseAmountReceived: baseAmountReceived
       });
 
-      // Update payment with webhook data
+      // Update payment with webhook data including isCredited status
       const updatedPayment = await payment.update({
         status: internalStatus,
         baseAmountReceived: baseAmountReceived ? parseFloat(baseAmountReceived) : payment.baseAmountReceived,
@@ -389,7 +389,9 @@ class CryptoPaymentService {
         transactionDetails: {
           ...payment.transactionDetails,
           webhookData,
-          lastUpdated: new Date().toISOString()
+          lastUpdated: new Date().toISOString(),
+          isCredited: webhookData.isCredited || 0,
+          isFinal: webhookData.isFinal || 0
         }
       }, { transaction });
 
@@ -404,49 +406,97 @@ class CryptoPaymentService {
       let newWalletBalance = previousWalletBalance;
       let transactionId = null;
 
-      // SIMPLE DUPLICATE DETECTION: Since we create only ONE record per payment request,
-      // any subsequent webhook for the same payment record is a duplicate if wallet was already credited
-      const isEligibleForCredit = ['COMPLETED', 'UNDERPAYMENT', 'OVERPAYMENT'].includes(internalStatus) && baseAmountReceived;
+      // ENHANCED DUPLICATE DETECTION: Credit wallet only when Tylt marks payment as credited for the first time
+      const isEligibleForCredit = ['COMPLETED', 'UNDERPAYMENT', 'OVERPAYMENT'].includes(internalStatus) && 
+                                 baseAmountReceived && 
+                                 webhookData.isCredited === 1;
+      
+      // ATOMIC CHECK: Use database record as source of truth to prevent race conditions
+      // If baseAmountReceived is already set, wallet was already credited (even if by concurrent webhook)
       const hasAlreadyBeenCredited = payment.baseAmountReceived !== null && payment.baseAmountReceived > 0;
-      const shouldCreditWallet = isEligibleForCredit && !hasAlreadyBeenCredited;
+      
+      // Additional check: if transactionDetails already has isCredited=1, it's a duplicate
+      const previouslyCredited = payment.transactionDetails?.isCredited === 1;
+      
+      const shouldCreditWallet = isEligibleForCredit && !hasAlreadyBeenCredited && !previouslyCredited;
 
-      logger.info('Duplicate detection check', {
+      logger.info('Enhanced duplicate detection check', {
         paymentId: payment.id,
         merchantOrderId: payment.merchantOrderId, // Use full merchantOrderId from DB
         receivedMerchantOrderId: merchantOrderId, // From webhook (possibly truncated)
         truncationDetected: isTruncated,
         internalStatus,
         baseAmountReceived,
+        tyltIsCredited: webhookData.isCredited,
+        tyltIsFinal: webhookData.isFinal,
         isEligibleForCredit,
+        previouslyCredited,
         hasAlreadyBeenCredited,
         shouldCreditWallet,
         previousBaseAmountReceived: payment.baseAmountReceived,
-        logic: 'One payment record = One wallet credit only'
+        logic: 'Credit wallet only when Tylt marks as credited for first time'
       });
 
       if (shouldCreditWallet) {
         try {
-          logger.info('Attempting wallet credit', {
+          logger.info('Attempting wallet credit with atomic check', {
             merchantOrderId,
             userId: payment.userId,
             amount: baseAmountReceived,
             internalStatus,
-            reason: 'First time processing this payment'
+            reason: 'First time processing this payment with isCredited=1'
           });
 
-          const creditResult = await this.creditUserWallet(payment.userId, parseFloat(baseAmountReceived), webhookData, transaction);
-          walletCreditSuccess = true;
-          walletCreditAmount = parseFloat(baseAmountReceived);
-          newWalletBalance = previousWalletBalance + walletCreditAmount;
-          transactionId = creditResult.transactionId;
+          // ATOMIC DATABASE UPDATE: Only credit if baseAmountReceived is still null
+          // This prevents race conditions between concurrent webhooks
+          const atomicUpdateResult = await CryptoPayment.update(
+            { 
+              baseAmountReceived: parseFloat(baseAmountReceived),
+              transactionDetails: {
+                ...payment.transactionDetails,
+                webhookData,
+                lastUpdated: new Date().toISOString(),
+                isCredited: webhookData.isCredited || 0,
+                isFinal: webhookData.isFinal || 0,
+                walletCreditProcessed: true
+              }
+            },
+            { 
+              where: { 
+                id: payment.id,
+                baseAmountReceived: null  // Only update if still null (atomic check)
+              },
+              transaction 
+            }
+          );
 
-          logger.info('Wallet credit successful', {
-            merchantOrderId,
-            userId: payment.userId,
-            amount: walletCreditAmount,
-            transactionId,
-            newBalance: newWalletBalance
-          });
+          // Check if the atomic update succeeded (affected 1 row)
+          if (atomicUpdateResult[0] === 1) {
+            // We won the race - proceed with wallet credit
+            const creditResult = await this.creditUserWallet(payment.userId, parseFloat(baseAmountReceived), webhookData, transaction);
+            walletCreditSuccess = true;
+            walletCreditAmount = parseFloat(baseAmountReceived);
+            newWalletBalance = previousWalletBalance + walletCreditAmount;
+            transactionId = creditResult.transactionId;
+
+            logger.info('Wallet credit successful (atomic update won)', {
+              merchantOrderId,
+              userId: payment.userId,
+              amount: walletCreditAmount,
+              transactionId,
+              newBalance: newWalletBalance,
+              atomicUpdateRows: atomicUpdateResult[0]
+            });
+          } else {
+            // Another webhook already processed this payment
+            logger.info('Wallet credit skipped - concurrent webhook already processed', {
+              merchantOrderId,
+              userId: payment.userId,
+              amount: baseAmountReceived,
+              atomicUpdateRows: atomicUpdateResult[0],
+              reason: 'Another webhook with isCredited=1 already credited the wallet'
+            });
+          }
         } catch (creditError) {
           logger.error('Failed to credit user wallet', { 
             merchantOrderId, 
@@ -460,9 +510,15 @@ class CryptoPaymentService {
       } else {
         let skipReason = '';
         if (!isEligibleForCredit) {
-          skipReason = !['COMPLETED', 'UNDERPAYMENT', 'OVERPAYMENT'].includes(internalStatus) 
-            ? `Status '${internalStatus}' not eligible for wallet credit` 
-            : 'No baseAmountReceived in webhook';
+          if (!['COMPLETED', 'UNDERPAYMENT', 'OVERPAYMENT'].includes(internalStatus)) {
+            skipReason = `Status '${internalStatus}' not eligible for wallet credit`;
+          } else if (!baseAmountReceived) {
+            skipReason = 'No baseAmountReceived in webhook';
+          } else if (webhookData.isCredited !== 1) {
+            skipReason = `Tylt isCredited flag is ${webhookData.isCredited}, not 1 (not credited by Tylt yet)`;
+          }
+        } else if (previouslyCredited) {
+          skipReason = 'DUPLICATE WEBHOOK: Already processed a credited webhook for this payment';
         } else if (hasAlreadyBeenCredited) {
           skipReason = 'DUPLICATE WEBHOOK: Payment record already processed for wallet credit';
         }
@@ -474,10 +530,13 @@ class CryptoPaymentService {
           truncationDetected: isTruncated,
           internalStatus,
           baseAmountReceived,
+          tyltIsCredited: webhookData.isCredited,
+          previouslyCredited,
+          hasAlreadyBeenCredited,
           previousBaseAmountReceived: payment.baseAmountReceived,
           reason: skipReason,
-          isDuplicateWebhook: hasAlreadyBeenCredited,
-          explanation: 'One payment record can only credit wallet once'
+          isDuplicateWebhook: previouslyCredited || hasAlreadyBeenCredited,
+          explanation: 'Credit wallet only when Tylt marks as credited for first time'
         });
       }
 

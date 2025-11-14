@@ -315,8 +315,8 @@ async function login(req, res, next) {
     const sessionId = uuidv4();
     // Generate JWT payload using auth service
     const jwtPayload = LiveUserAuthService.generateJWTPayload(user, loginType, sessionId);
-    // Generate access token (15 min expiry)
-    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: '30m', jwtid: sessionId });
+    // Generate access token (7 days expiry)
+    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: '7d', jwtid: sessionId });
     
     // Generate refresh token (7 days expiry)
     const refreshToken = jwt.sign(
@@ -363,7 +363,7 @@ async function login(req, res, next) {
       message: 'Login successful',
       access_token: token,
       refresh_token: refreshToken,
-      expires_in: 900, // 15 minutes in seconds
+      expires_in: 604800, // 7 days in seconds
       token_type: 'Bearer',
       session_id: sessionId
     });
@@ -424,7 +424,7 @@ async function refreshToken(req, res) {
     const jwtPayload = LiveUserAuthService.generateJWTPayload(user, loginType, sessionId);
     
     const newAccessToken = jwt.sign(jwtPayload, JWT_SECRET, { 
-      expiresIn: '2m', 
+      expiresIn: '7d', 
       jwtid: sessionId 
     });
 
@@ -456,7 +456,7 @@ async function refreshToken(req, res) {
       message: 'Token refreshed successfully',
       access_token: newAccessToken,
       refresh_token: newRefreshToken,
-      expires_in: 900, // 15 minutes in seconds
+      expires_in: 604800, // 7 days in seconds
       token_type: 'Bearer',
       session_id: sessionId
     });
